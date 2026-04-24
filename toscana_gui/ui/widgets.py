@@ -665,6 +665,111 @@ def initialize_shell_widgets(shell) -> None:
         sizing_mode="stretch_width",
         visible=False,
     )
+
+    shell.background_vanadium_chi_plot_pane = pn.pane.Plotly(
+        None,
+        sizing_mode="stretch_width",
+        config={"responsive": True},
+    )
+    shell.background_vanadium_subtraction_plot_pane = pn.pane.Plotly(
+        None,
+        sizing_mode="stretch_width",
+        config={"responsive": True},
+    )
+    shell.background_vanadium_chi_plot_card = pn.Card(
+        shell.background_vanadium_chi_plot_pane,
+        title="Vanadium: χ vs t",
+        sizing_mode="stretch_width",
+        visible=False,
+    )
+    shell.background_vanadium_subtraction_plot_card = pn.Card(
+        shell.background_vanadium_subtraction_plot_pane,
+        title="Vanadium: Background subtraction",
+        sizing_mode="stretch_width",
+        visible=False,
+    )
+    shell.background_final_signals_plot_pane = pn.pane.Plotly(
+        None,
+        sizing_mode="stretch_width",
+        config={"responsive": True},
+    )
+    shell.background_final_signals_plot_card = pn.Card(
+        shell.background_final_signals_plot_pane,
+        title="Background-subtracted signals",
+        sizing_mode="stretch_width",
+        visible=False,
+    )
+
+    shell.background_export_folder_input = pn.widgets.TextInput(
+        name="Export folder",
+        value="processed/qspdata",
+        placeholder="processed/qspdata",
+        sizing_mode="stretch_width",
+    )
+    shell.background_export_button = pn.widgets.Button(
+        name="Export Data",
+        button_type="primary",
+        sizing_mode="fixed",
+        width=180,
+        height=48,
+        disabled=True,
+    )
+    shell.background_export_info_hover = pn.pane.HTML(
+        "",
+        sizing_mode="fixed",
+        width=40,
+        margin=(0, 0, 0, 0),
+        styles={"overflow": "visible"},
+    )
+    shell.background_export_prompt = pn.pane.Alert(
+        "",
+        alert_type="warning",
+        sizing_mode="stretch_width",
+        visible=False,
+    )
+    shell.background_export_confirm_button = pn.widgets.Button(
+        name="Proceed",
+        button_type="danger",
+        sizing_mode="fixed",
+        width=140,
+        height=44,
+        disabled=False,
+    )
+    shell.background_export_cancel_button = pn.widgets.Button(
+        name="Cancel",
+        button_type="light",
+        sizing_mode="fixed",
+        width=120,
+        height=44,
+        disabled=False,
+    )
+    shell.background_export_prompt_card = pn.Card(
+        shell.background_export_prompt,
+        pn.Row(
+            shell.background_export_confirm_button,
+            shell.background_export_cancel_button,
+        ),
+        title="Confirm Export",
+        sizing_mode="stretch_width",
+        visible=False,
+    )
+    shell.background_export_card = pn.Card(
+        pn.Column(
+            shell.background_export_folder_input,
+            pn.Row(
+                shell.background_export_button,
+                shell.background_export_info_hover,
+                sizing_mode="stretch_width",
+            ),
+            sizing_mode="stretch_width",
+        ),
+        shell.background_export_prompt_card,
+        title="Export Data",
+        sizing_mode="stretch_width",
+        css_classes=["toscana-overflow-visible"],
+        styles={"overflow": "visible", "margin-bottom": "180px"},
+        visible=True,
+    )
     shell.background_linear_chi_plot_pane = pn.pane.Plotly(
         None,
         sizing_mode="stretch_width",

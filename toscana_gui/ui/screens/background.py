@@ -63,7 +63,11 @@ def build_background_section(shell) -> pn.Column:
             shell.background_subtraction_plot_card,
             shell.background_linear_controls_card,
             shell.background_vanadium_controls_card,
+            shell.background_vanadium_chi_plot_card,
+            shell.background_vanadium_subtraction_plot_card,
+            shell.background_final_signals_plot_card,
             shell.background_monte_carlo_card,
+            shell.background_export_card,
         ]
     )
 

@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 
 import numpy as np
@@ -26,12 +28,16 @@ from toscana_gui.paths import REPO_ROOT
 from toscana_gui.persistence import OutputPaths, PARIS_TZ, RunRecord, now_iso
 from toscana_gui.background.plots import build_direct_subtraction_figure, build_raw_data_figure
 from toscana_gui.background.plots import (
+    build_final_background_subtracted_signals_figure,
     build_linear_combination_chi_figure,
     build_linear_combination_subtraction_figure,
+    build_vanadium_chi_figure,
+    build_vanadium_subtraction_figure,
 )
 from toscana_gui.background.tasks import _working_directory
 from ntsa.experiment.measurement import Measurement
 from ntsa.math.fitting import fit_and_find_extremum, get_chi
+from ntsa.io.saving import saveFile_xye
 from ntsa.math.operations import binary_sum
 from ntsa.math.signal_processing import smooth_curve
 
@@ -39,6 +45,505 @@ BACKGROUND_SUBPROCESS_WORKER = REPO_ROOT / "background_subprocess_worker.py"
 
 
 class BackgroundControllerMixin:
+    _BACKGROUND_READY_TO_EXTRACT_MESSAGE = "Selected sample `.par` file is ready to extract."
+    _BACKGROUND_EXPORT_NO_DATA_MESSAGE = "No data found to export. Run the background subtraction process."
+
+    def _clear_background_cached_measurement_state(self) -> None:
+        self._background_cached_measurement = None
+        self._background_cached_artifact_path = None
+        self._background_cached_artifact_mtime = None
+        self._background_cached_par_filename = None
+        self._background_cached_par_path = None
+
+    def _show_background_ready_to_extract_toast(self) -> None:
+        # Success state should not linger as an inline alert (it reads like a stale banner).
+        self._show_success_toast(self._BACKGROUND_READY_TO_EXTRACT_MESSAGE)
+        if hasattr(self, "background_message"):
+            self.background_message.visible = False
+            self.background_message.object = ""
+            self.background_message.alert_type = "secondary"
+
+    def _set_background_message_inline(self, message: str, *, alert_type: str) -> None:
+        if not hasattr(self, "background_message"):
+            return
+        self.background_message.visible = True
+        self.background_message.object = message
+        self.background_message.alert_type = alert_type
+
+    def _sync_background_export_prompt_visibility(self) -> None:
+        if not hasattr(self, "background_export_prompt_card"):
+            return
+        visible = bool(getattr(self.background_export_prompt, "visible", False))
+        self.background_export_prompt_card.visible = visible
+
+    def _sanitize_export_filename_stem(self, value: str) -> str:
+        invalid = r'<>:"/\\|?*'
+        cleaned = re.sub(f"[{re.escape(invalid)}]", "", str(value or "")).strip()
+        cleaned = cleaned.strip().rstrip(" .")
+        if not cleaned:
+            return "sample"
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        return cleaned[:120]
+
+    def _resolve_background_export_dir(self) -> Path | None:
+        if self.current_project_root is None:
+            return None
+        raw = str(getattr(self, "background_export_folder_input", None).value or "").strip() if hasattr(
+            self, "background_export_folder_input"
+        ) else ""
+        if not raw:
+            raw = "processed/qspdata"
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (self.current_project_root / candidate).resolve(strict=False)
+        return candidate
+
+    def _background_export_snapshot(self) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "ready": False,
+            "sample_name": None,
+            "sample_t": None,
+            "vanadium_t": None,
+            "sample_qdat": None,
+            "vanadium_qdat": None,
+            "export_dir": None,
+            "reason": None,
+        }
+
+        if self.current_project_state is None or self.current_project_root is None:
+            snapshot["reason"] = "Open a project first."
+            return snapshot
+
+        export_dir = self._resolve_background_export_dir()
+        snapshot["export_dir"] = str(export_dir) if export_dir is not None else None
+
+        state = self._get_background_state()
+        par_path_str = str(state.get("selected_par_path") or "").strip() or str(
+            state.get("validation", {}).get("selected_par_path") or ""
+        ).strip()
+        if not par_path_str:
+            snapshot["reason"] = "Select and extract a sample first."
+            return snapshot
+
+        sample_name = None
+        measurement = self._background_export_measurement_snapshot().get("measurement")
+        if measurement is not None:
+            sample_name = getattr(measurement, "Title", None)
+        if not sample_name:
+            sample_name = Path(par_path_str).stem
+        snapshot["sample_name"] = str(sample_name)
+
+        sample_key = background_sample_key(Path(par_path_str), self.current_project_root)
+        cached = state.get("measurements_by_par")
+        if not sample_key or not isinstance(cached, dict):
+            snapshot["reason"] = "Extract a sample first."
+            return snapshot
+        entry = cached.get(sample_key)
+        if not isinstance(entry, dict):
+            snapshot["reason"] = "Extract a sample first."
+            return snapshot
+
+        linear = entry.get("linear_combination")
+        vanadium = entry.get("vanadium_linear_combination")
+        if not isinstance(linear, dict) or not isinstance(vanadium, dict):
+            snapshot["reason"] = "Compute both Sample and Vanadium linear combinations first."
+            return snapshot
+
+        sample_t = linear.get("effective_t")
+        vanadium_t = vanadium.get("effective_t")
+        if not isinstance(sample_t, (int, float)) or not isinstance(vanadium_t, (int, float)):
+            snapshot["reason"] = "Compute both Sample and Vanadium linear combinations first."
+            return snapshot
+
+        snapshot["sample_t"] = float(sample_t)
+        snapshot["vanadium_t"] = float(vanadium_t)
+
+        if export_dir is None:
+            snapshot["reason"] = "Choose an export folder."
+            return snapshot
+
+        stem = self._sanitize_export_filename_stem(str(sample_name))
+        sample_qdat = export_dir / f"{stem}_sub.qdat"
+        vanadium_qdat = export_dir / "vanadium_sub.qdat"
+        snapshot["sample_qdat"] = str(sample_qdat)
+        snapshot["vanadium_qdat"] = str(vanadium_qdat)
+
+        artifact = state.get("latest_measurement_artifact")
+        if not artifact:
+            snapshot["reason"] = "Extract a sample first."
+            return snapshot
+        artifact_path = Path(str(artifact)).expanduser()
+        if not artifact_path.is_absolute():
+            artifact_path = (self.current_project_root / artifact_path).resolve(strict=False)
+        if not artifact_path.exists():
+            snapshot["reason"] = "Extract a sample first (measurement artifact missing)."
+            return snapshot
+
+        measurement_snapshot = self._background_export_measurement_snapshot()
+        if not measurement_snapshot.get("ready", False):
+            snapshot["reason"] = str(
+                measurement_snapshot.get("reason") or self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+            )
+            return snapshot
+
+        snapshot["ready"] = True
+        snapshot["reason"] = None
+        return snapshot
+
+    def _background_export_measurement_snapshot(self) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "ready": False,
+            "measurement": None,
+            "sample_data": None,
+            "container_data": None,
+            "environment_data": None,
+            "vanadium_data": None,
+            "reason": None,
+        }
+
+        measurement = self._load_latest_measurement()
+        if measurement is None:
+            snapshot["reason"] = self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+            return snapshot
+
+        arrays: dict[str, np.ndarray] = {}
+        required_sources = {
+            "sample_data": ("Data", "sample"),
+            "container_data": ("conData", "container"),
+            "environment_data": ("envData", "environment"),
+            "vanadium_data": ("norData", "vanadium"),
+        }
+        for key, (attribute_name, label) in required_sources.items():
+            raw_value = getattr(measurement, attribute_name, None)
+            if raw_value is None:
+                snapshot["reason"] = self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+                snapshot["measurement"] = measurement
+                return snapshot
+            array = np.asarray(raw_value)
+            if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] < 2:
+                snapshot["reason"] = self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+                snapshot["measurement"] = measurement
+                return snapshot
+            arrays[key] = array
+
+        sample_data = arrays["sample_data"]
+        container_data = arrays["container_data"]
+        environment_data = arrays["environment_data"]
+        vanadium_data = arrays["vanadium_data"]
+
+        if sample_data.shape[0] != container_data.shape[0] or sample_data.shape[0] != environment_data.shape[0]:
+            snapshot["reason"] = self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+            snapshot["measurement"] = measurement
+            return snapshot
+        if vanadium_data.shape[0] != environment_data.shape[0]:
+            snapshot["reason"] = self._BACKGROUND_EXPORT_NO_DATA_MESSAGE
+            snapshot["measurement"] = measurement
+            return snapshot
+
+        snapshot["ready"] = True
+        snapshot["measurement"] = measurement
+        snapshot["sample_data"] = sample_data
+        snapshot["container_data"] = container_data
+        snapshot["environment_data"] = environment_data
+        snapshot["vanadium_data"] = vanadium_data
+        snapshot["reason"] = None
+        return snapshot
+
+    def _refresh_background_export_hovercard(self) -> None:
+        if not hasattr(self, "background_export_info_hover"):
+            return
+
+        snap = self._background_export_snapshot()
+        ready = bool(snap.get("ready", False))
+        status = "Ready" if ready else "Not ready"
+        reason = html_escape(str(snap.get("reason") or ""))
+
+        body_lines = [
+            f"<div><strong>Status:</strong> {html_escape(status)}</div>",
+        ]
+        if ready:
+            sample_name = html_escape(str(snap.get("sample_name") or ""))
+            sample_t = snap.get("sample_t")
+            vanadium_t = snap.get("vanadium_t")
+            sample_t_text = "missing" if sample_t is None else f"{float(sample_t):.5f}"
+            vanadium_t_text = "missing" if vanadium_t is None else f"{float(vanadium_t):.5f}"
+            sample_qdat = html_escape(str(snap.get("sample_qdat") or ""))
+            van_qdat = html_escape(str(snap.get("vanadium_qdat") or ""))
+            if sample_name:
+                body_lines.append(f"<div><strong>Sample:</strong> {sample_name}</div>")
+            body_lines.append(f"<div><strong>t sample:</strong> <code>{html_escape(sample_t_text)}</code></div>")
+            if sample_qdat:
+                body_lines.append(f"<div><strong>Qdat sample:</strong> <code>{sample_qdat}</code></div>")
+            body_lines.append(f"<div><strong>Normalisation:</strong> Vanadium</div>")
+            body_lines.append(f"<div><strong>t normalisation:</strong> <code>{html_escape(vanadium_t_text)}</code></div>")
+            if van_qdat:
+                body_lines.append(f"<div><strong>Qdat vanadium:</strong> <code>{van_qdat}</code></div>")
+        elif reason:
+            body_lines.append(f"<div style=\"margin-top: 8px;\"><em>{reason}</em></div>")
+
+        self.background_export_info_hover.object = (
+            """
+            <div class="toscana-hovercard toscana-hovercard--open-right" aria-label="Export status">
+              <div class="toscana-hovercard__icon" title="Export status">&#8505;</div>
+              <div class="toscana-hovercard__panel">
+            """
+            + "\n".join(body_lines)
+            + """
+              </div>
+            </div>
+            """
+        ).strip()
+
+    def _background_export_is_ready(self) -> bool:
+        return bool(self._background_export_snapshot().get("ready", False))
+
+    def _on_background_export_folder_change(self, event) -> None:
+        if getattr(self, "_suspend_background_events", False) or self.current_project_state is None:
+            return
+        if event.new == event.old:
+            return
+        # Changing the folder invalidates any pending confirmation prompt.
+        self._pending_background_export = None
+        if hasattr(self, "background_export_prompt"):
+            self.background_export_prompt.visible = False
+        self._sync_background_export_prompt_visibility()
+        self._refresh_background_export_hovercard()
+        self._refresh_interaction_states()
+
+    def _prompt_background_export(self, _event=None) -> None:
+        if self.operation_in_progress:
+            self._show_workspace_blocked_message()
+            return
+        if self.current_project_state is None or self.current_project_root is None:
+            self._show_warning_toast("Open a project first.")
+            return
+
+        snap = self._background_export_snapshot()
+        if not snap.get("ready", False):
+            self._show_warning_toast(str(snap.get("reason") or "Export is not ready yet."))
+            return
+
+        export_dir = Path(str(snap["export_dir"]))
+        sample_qdat = Path(str(snap["sample_qdat"]))
+        vanadium_qdat = Path(str(snap["vanadium_qdat"]))
+
+        measurement_snapshot = self._background_export_measurement_snapshot()
+        if not measurement_snapshot.get("ready", False):
+            self._show_warning_toast(
+                str(measurement_snapshot.get("reason") or "No extracted data is available to export yet.")
+            )
+            return
+        dat_arr = np.asarray(measurement_snapshot["sample_data"])
+        con_arr = np.asarray(measurement_snapshot["container_data"])
+        env_arr = np.asarray(measurement_snapshot["environment_data"])
+        nor_arr = np.asarray(measurement_snapshot["vanadium_data"])
+
+        def _has_err(a: np.ndarray) -> bool:
+            return isinstance(a, np.ndarray) and a.ndim == 2 and a.shape[1] >= 3
+
+        missing_sample_error = not (_has_err(dat_arr) and _has_err(con_arr) and _has_err(env_arr))
+        missing_van_error = not (_has_err(nor_arr) and _has_err(env_arr))
+        missing_error_any = bool(missing_sample_error or missing_van_error)
+
+        overwrite_targets: list[str] = []
+        if sample_qdat.exists():
+            overwrite_targets.append(str(sample_qdat))
+        if vanadium_qdat.exists():
+            overwrite_targets.append(str(vanadium_qdat))
+
+        self._pending_background_export = {
+            "export_dir": export_dir,
+            "sample_qdat": sample_qdat,
+            "vanadium_qdat": vanadium_qdat,
+            "write_zero_errors": bool(missing_error_any),
+        }
+
+        if overwrite_targets or missing_error_any:
+            lines: list[str] = [
+                f"Export folder: `{export_dir}`",
+                "",
+                f"Will write sample: `{sample_qdat.name}`",
+                f"Will write vanadium: `{vanadium_qdat.name}`",
+            ]
+            if overwrite_targets:
+                lines.extend(["", "**Overwrite warning:**", *[f"- `{p}`" for p in overwrite_targets]])
+            if missing_error_any:
+                missing_parts = []
+                if missing_sample_error:
+                    missing_parts.append("sample")
+                if missing_van_error:
+                    missing_parts.append("vanadium")
+                lines.extend(
+                    [
+                        "",
+                        "**Missing error column:**",
+                        f"Error bars are missing for: {', '.join(missing_parts)}.",
+                        "Proceeding will write zeros in the error column for those exports.",
+                    ]
+                )
+
+            self.background_export_prompt.object = "\n".join(lines)
+            self.background_export_prompt.alert_type = "warning" if missing_error_any else "danger"
+            self.background_export_prompt.visible = True
+            self._sync_background_export_prompt_visibility()
+            self._refresh_interaction_states()
+            return
+
+        self._perform_background_export()
+
+    def _cancel_background_export(self, _event=None) -> None:
+        self._pending_background_export = None
+        if hasattr(self, "background_export_prompt"):
+            self.background_export_prompt.visible = False
+        self._sync_background_export_prompt_visibility()
+        self._refresh_interaction_states()
+
+    def _confirm_background_export(self, _event=None) -> None:
+        if self.operation_in_progress:
+            self._show_workspace_blocked_message()
+            return
+        if self._pending_background_export is None:
+            return
+        self._perform_background_export()
+
+    def _perform_background_export(self) -> None:
+        snap = self._background_export_snapshot()
+        if not snap.get("ready", False):
+            self._show_warning_toast(str(snap.get("reason") or "Export is not ready yet."))
+            return
+        if self.current_project_root is None or self.current_project_state is None:
+            return
+
+        export_dir = Path(str(snap["export_dir"]))
+        sample_qdat = Path(str(snap["sample_qdat"]))
+        vanadium_qdat = Path(str(snap["vanadium_qdat"]))
+        pending = getattr(self, "_pending_background_export", None)
+        write_zero_errors = bool(pending.get("write_zero_errors", False)) if isinstance(pending, dict) else False
+
+        measurement_snapshot = self._background_export_measurement_snapshot()
+        if not measurement_snapshot.get("ready", False):
+            self._show_warning_toast(
+                str(measurement_snapshot.get("reason") or "No extracted data is available to export yet.")
+            )
+            return
+        sample_t = float(snap["sample_t"])
+        vanadium_t = float(snap["vanadium_t"])
+
+        run_id = self._create_run_id()
+        record = RunRecord(
+            run_id=run_id,
+            workflow="background_export",
+            status="running",
+            started_at=now_iso(),
+            summary=f"Exporting qdat files to `{export_dir}`",
+            workflow_data={
+                "export_dir": str(export_dir),
+                "sample_qdat": str(sample_qdat),
+                "vanadium_qdat": str(vanadium_qdat),
+                "t_sample": sample_t,
+                "t_vanadium": vanadium_t,
+                "write_zero_errors": write_zero_errors,
+            },
+            output_paths=OutputPaths(generated_files=[]),
+        )
+        self.current_project_state.runs.append(record)
+        self.current_project_state.project.updated_at = now_iso()
+        self._persist_current_project_state()
+
+        try:
+            dat_arr = np.asarray(measurement_snapshot["sample_data"])
+            con_arr = np.asarray(measurement_snapshot["container_data"])
+            env_arr = np.asarray(measurement_snapshot["environment_data"])
+            nor_arr = np.asarray(measurement_snapshot["vanadium_data"])
+
+            export_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build exported series.
+            x = dat_arr[:, 0]
+            sample_y = dat_arr[:, 1] - (sample_t * con_arr[:, 1] + (1.0 - sample_t) * env_arr[:, 1])
+            sample_e = np.zeros_like(sample_y, dtype=float)
+            if dat_arr.shape[1] >= 3 and con_arr.shape[1] >= 3 and env_arr.shape[1] >= 3:
+                bckgt = binary_sum(sample_t, con_arr, 1.0 - sample_t, env_arr)
+                subt = binary_sum(1.0, dat_arr, -1.0, bckgt) if bckgt is not None else None
+                if subt is not None and subt.shape[1] >= 3:
+                    sample_y = subt[:, 1]
+                    sample_e = subt[:, 2]
+            elif not write_zero_errors:
+                raise RuntimeError("Missing error columns for sample export.")
+
+            vx = nor_arr[:, 0]
+            van_y = nor_arr[:, 1] - vanadium_t * env_arr[:, 1]
+            van_e = np.zeros_like(van_y, dtype=float)
+            if nor_arr.shape[1] >= 3 and env_arr.shape[1] >= 3:
+                subt = binary_sum(1.0, nor_arr, -vanadium_t, env_arr)
+                if subt is not None and subt.shape[1] >= 3:
+                    van_y = subt[:, 1]
+                    van_e = subt[:, 2]
+            elif not write_zero_errors:
+                raise RuntimeError("Missing error columns for vanadium export.")
+
+            sample_heading = [
+                "Background subtracted diffractogram",
+                "Subtraction method: sample - (t*cell+(1-t)*env)",
+                f"t = {sample_t:.5f}",
+                " ",
+                " Q (1/Å)         Intensity              Error",
+            ]
+            van_heading = [
+                "Background subtracted diffractogram",
+                "Subtraction method: vanadium - (t*env)",
+                f"t = {vanadium_t:.5f}",
+                " ",
+                " Q (1/Å)         Intensity              Error",
+            ]
+
+            saveFile_xye(str(sample_qdat), x, sample_y, sample_e, sample_heading)
+            saveFile_xye(str(vanadium_qdat), vx, van_y, van_e, van_heading)
+
+            record.status = "succeeded"
+            record.finished_at = now_iso()
+            record.summary = "Exported qdat files."
+            record.output_paths.generated_files = [
+                str(sample_qdat.resolve(strict=False)),
+                str(vanadium_qdat.resolve(strict=False)),
+            ]
+            self.current_project_state.project.updated_at = now_iso()
+            self._persist_current_project_state()
+            self._show_success_toast("Exported qdat files.")
+        except Exception as exc:
+            record.status = "failed"
+            record.finished_at = now_iso()
+            record.error = str(exc)
+            self.current_project_state.project.updated_at = now_iso()
+            self._persist_current_project_state()
+            self._show_error_toast(f"Export failed: {exc}")
+        finally:
+            self._pending_background_export = None
+            if hasattr(self, "background_export_prompt"):
+                self.background_export_prompt.visible = False
+            self._sync_background_export_prompt_visibility()
+            self._refresh_interaction_states()
+            self._refresh_background_export_hovercard()
+
+    def _clear_background_linear_and_vanadium_plot_cards(self) -> None:
+        if hasattr(self, "background_linear_chi_plot_pane"):
+            self.background_linear_chi_plot_pane.object = None
+        if hasattr(self, "background_linear_subtraction_plot_pane"):
+            self.background_linear_subtraction_plot_pane.object = None
+        if hasattr(self, "background_vanadium_chi_plot_pane"):
+            self.background_vanadium_chi_plot_pane.object = None
+        if hasattr(self, "background_vanadium_subtraction_plot_pane"):
+            self.background_vanadium_subtraction_plot_pane.object = None
+        if hasattr(self, "background_final_signals_plot_pane"):
+            self.background_final_signals_plot_pane.object = None
+
+        if hasattr(self, "background_vanadium_chi_plot_card"):
+            self.background_vanadium_chi_plot_card.visible = False
+        if hasattr(self, "background_vanadium_subtraction_plot_card"):
+            self.background_vanadium_subtraction_plot_card.visible = False
+        if hasattr(self, "background_final_signals_plot_card"):
+            self.background_final_signals_plot_card.visible = False
+
     def _reset_background_t_controls_ui(self) -> None:
         self._suspend_background_events = True
         try:
@@ -301,6 +806,7 @@ class BackgroundControllerMixin:
         else:
             self.background_vanadium_message.object = "Computed best t."
             self.background_vanadium_message.alert_type = "success"
+        self._refresh_background_plots()
         self._refresh_interaction_states()
 
     def _run_vanadium_linear_combination(self, measurement, *, settings: dict) -> dict:
@@ -414,6 +920,7 @@ class BackgroundControllerMixin:
         if self.current_project_state is None:
             return
 
+        self._clear_background_cached_measurement_state()
         state = self._get_background_state()
         self._suspend_background_events = True
         self.background_source_mode.value = state["source_mode"]
@@ -467,20 +974,20 @@ class BackgroundControllerMixin:
         self.background_extract_button.disabled = not bool(validation_state.get("is_valid", False))
 
         if validation_state.get("is_valid"):
-            self.background_message.object = ""
-            self.background_message.alert_type = "secondary"
-            self.background_message.visible = False
+            self._show_background_ready_to_extract_toast()
         elif state.get("selected_par_path"):
-            self.background_message.object = (
+            self._set_background_message_inline(
+                (
                 validation_state.get("error")
                 or "The remembered sample `.par` selection needs validation."
+                ),
+                alert_type="warning",
             )
-            self.background_message.alert_type = "warning"
-            self.background_message.visible = True
         else:
-            self.background_message.object = "Select a sample `.par` file to get started."
-            self.background_message.alert_type = "secondary"
-            self.background_message.visible = True
+            self._set_background_message_inline(
+                "Select a sample `.par` file to get started.",
+                alert_type="secondary",
+            )
 
     def _on_background_subtraction_method_change(self, event) -> None:
         if getattr(self, "_suspend_background_events", False) or self.current_project_state is None:
@@ -579,20 +1086,26 @@ class BackgroundControllerMixin:
 
         if update_message:
             if signature is None:
-                self.background_message.object = (
-                    "Loaded cached extraction, but the sample `.par` file is missing. "
-                    "Re-extract is unavailable until the file is restored."
+                self._set_background_message_inline(
+                    (
+                        "Loaded cached extraction, but the sample `.par` file is missing. "
+                        "Re-extract is unavailable until the file is restored."
+                    ),
+                    alert_type="warning",
                 )
-                self.background_message.alert_type = "warning"
             elif stale:
-                self.background_message.object = (
-                    "Loaded cached extraction. The `.par` file has changed since extraction; "
-                    "re-extract is recommended."
+                self._set_background_message_inline(
+                    (
+                        "Loaded cached extraction. The `.par` file has changed since extraction; "
+                        "re-extract is recommended."
+                    ),
+                    alert_type="warning",
                 )
-                self.background_message.alert_type = "warning"
             else:
-                self.background_message.object = "Loaded cached extraction for this sample."
-                self.background_message.alert_type = "success"
+                self._set_background_message_inline(
+                    "Loaded cached extraction for this sample.",
+                    alert_type="success",
+                )
 
         return True
 
@@ -905,6 +1418,18 @@ class BackgroundControllerMixin:
             self.background_linear_chi_plot_pane.visible = has_measurement and show_linear_combination
         if hasattr(self, "background_linear_subtraction_plot_pane"):
             self.background_linear_subtraction_plot_pane.visible = has_measurement and show_linear_combination
+        if hasattr(self, "background_vanadium_chi_plot_card"):
+            self.background_vanadium_chi_plot_card.visible = has_measurement and show_linear_combination and bool(
+                getattr(self.background_vanadium_chi_plot_pane, "object", None)
+            )
+        if hasattr(self, "background_vanadium_subtraction_plot_card"):
+            self.background_vanadium_subtraction_plot_card.visible = has_measurement and show_linear_combination and bool(
+                getattr(self.background_vanadium_subtraction_plot_pane, "object", None)
+            )
+        if hasattr(self, "background_final_signals_plot_card"):
+            self.background_final_signals_plot_card.visible = has_measurement and show_linear_combination and bool(
+                getattr(self.background_final_signals_plot_pane, "object", None)
+            )
 
     def _refresh_background_plots(self) -> None:
         if self.current_project_state is None:
@@ -914,6 +1439,7 @@ class BackgroundControllerMixin:
         if measurement is None:
             self.background_raw_plot_pane.object = None
             self.background_subtraction_plot_pane.object = None
+            self._clear_background_linear_and_vanadium_plot_cards()
             self.background_raw_plot_alert.object = ""
             self.background_subtraction_plot_alert.object = ""
             self._set_background_plot_visibility(
@@ -969,9 +1495,10 @@ class BackgroundControllerMixin:
 
         if show_linear_combination:
             self._refresh_background_linear_combination_plots(measurement, show_error_bars=show_error_bars)
+            self._refresh_background_vanadium_plots(measurement, show_error_bars=show_error_bars)
+            self._refresh_background_final_signals_plot(measurement, show_error_bars=show_error_bars)
         else:
-            self.background_linear_chi_plot_pane.object = None
-            self.background_linear_subtraction_plot_pane.object = None
+            self._clear_background_linear_and_vanadium_plot_cards()
 
         self._set_background_plot_visibility(
             has_measurement=True,
@@ -1079,11 +1606,192 @@ class BackgroundControllerMixin:
             error_y=error_y,
         )
 
+    def _refresh_background_vanadium_plots(self, measurement, *, show_error_bars: bool) -> None:
+        if (
+            self.current_project_state is None
+            or self.current_project_root is None
+            or not hasattr(self, "background_vanadium_chi_plot_pane")
+            or not hasattr(self, "background_vanadium_subtraction_plot_pane")
+        ):
+            return
+
+        state = self._get_background_state()
+        par_path_str = getattr(self, "_background_cached_par_path", None)
+        if not par_path_str:
+            return
+        sample_key = background_sample_key(Path(par_path_str), self.current_project_root)
+        if not sample_key:
+            return
+        cached = state.get("measurements_by_par")
+        if not isinstance(cached, dict):
+            return
+        entry = cached.get(sample_key)
+        if not isinstance(entry, dict):
+            return
+
+        vanadium = entry.get("vanadium_linear_combination")
+        if not isinstance(vanadium, dict):
+            self.background_vanadium_chi_plot_pane.object = None
+            self.background_vanadium_subtraction_plot_pane.object = None
+            return
+
+        trans = list(vanadium.get("trans") or [])
+        chi = list(vanadium.get("chi") or [])
+        fitted = list(vanadium.get("fitted") or [])
+        best_t_raw = vanadium.get("best_t")
+        best_t = float(best_t_raw) if isinstance(best_t_raw, (int, float)) else None
+        effective_raw = vanadium.get("effective_t")
+        effective_t = float(effective_raw) if isinstance(effective_raw, (int, float)) else best_t
+
+        self.background_vanadium_chi_plot_pane.object = build_vanadium_chi_figure(
+            trans,
+            chi,
+            fitted,
+            best_t=best_t,
+            effective_t=effective_t,
+        )
+
+        nor = getattr(measurement, "norData", None)
+        env = getattr(measurement, "envData", None)
+        if nor is None or env is None or effective_t is None:
+            self.background_vanadium_subtraction_plot_pane.object = None
+            return
+        nor_arr = np.asarray(nor)
+        env_arr = np.asarray(env)
+        if nor_arr.ndim != 2 or env_arr.ndim != 2:
+            self.background_vanadium_subtraction_plot_pane.object = None
+            return
+        if nor_arr.shape[0] != env_arr.shape[0]:
+            self.background_vanadium_subtraction_plot_pane.object = None
+            return
+        if not np.array_equal(nor_arr[:, 0], env_arr[:, 0]):
+            self.background_vanadium_subtraction_plot_pane.object = None
+            return
+
+        x = nor_arr[:, 0]
+        vanadium_y = nor_arr[:, 1]
+        background_y = float(effective_t) * env_arr[:, 1]
+        subtracted_y = vanadium_y - background_y
+        error_y = None
+
+        if show_error_bars and nor_arr.shape[1] >= 3 and env_arr.shape[1] >= 3:
+            subt = binary_sum(1.0, nor_arr, -float(effective_t), env_arr)
+            if subt is not None and getattr(subt, "ndim", 0) == 2 and subt.shape[1] >= 3:
+                subtracted_y = subt[:, 1]
+                error_y = subt[:, 2]
+
+        title = f"Vanadium subtraction (t = {float(effective_t):.2f})"
+        self.background_vanadium_subtraction_plot_pane.object = build_vanadium_subtraction_figure(
+            x=x,
+            vanadium_y=vanadium_y,
+            background_y=background_y,
+            subtracted_y=subtracted_y,
+            title=title,
+            error_y=error_y,
+        )
+
+    def _refresh_background_final_signals_plot(self, measurement, *, show_error_bars: bool) -> None:
+        if (
+            self.current_project_state is None
+            or self.current_project_root is None
+            or not hasattr(self, "background_final_signals_plot_pane")
+        ):
+            return
+
+        state = self._get_background_state()
+        par_path_str = getattr(self, "_background_cached_par_path", None)
+        if not par_path_str:
+            self.background_final_signals_plot_pane.object = None
+            return
+        sample_key = background_sample_key(Path(par_path_str), self.current_project_root)
+        if not sample_key:
+            self.background_final_signals_plot_pane.object = None
+            return
+        cached = state.get("measurements_by_par")
+        if not isinstance(cached, dict):
+            self.background_final_signals_plot_pane.object = None
+            return
+        entry = cached.get(sample_key)
+        if not isinstance(entry, dict):
+            self.background_final_signals_plot_pane.object = None
+            return
+
+        linear = entry.get("linear_combination")
+        vanadium = entry.get("vanadium_linear_combination")
+        if not isinstance(linear, dict) or not isinstance(vanadium, dict):
+            self.background_final_signals_plot_pane.object = None
+            return
+
+        sample_t_raw = linear.get("effective_t")
+        van_t_raw = vanadium.get("effective_t")
+        if not isinstance(sample_t_raw, (int, float)) or not isinstance(van_t_raw, (int, float)):
+            self.background_final_signals_plot_pane.object = None
+            return
+        sample_t = float(sample_t_raw)
+        van_t = float(van_t_raw)
+
+        dat = getattr(measurement, "Data", None)
+        con = getattr(measurement, "conData", None)
+        env = getattr(measurement, "envData", None)
+        nor = getattr(measurement, "norData", None)
+        if dat is None or con is None or env is None or nor is None:
+            self.background_final_signals_plot_pane.object = None
+            return
+
+        dat_arr = np.asarray(dat)
+        con_arr = np.asarray(con)
+        env_arr = np.asarray(env)
+        nor_arr = np.asarray(nor)
+        if dat_arr.ndim != 2 or con_arr.ndim != 2 or env_arr.ndim != 2 or nor_arr.ndim != 2:
+            self.background_final_signals_plot_pane.object = None
+            return
+        if dat_arr.shape[0] != con_arr.shape[0] or dat_arr.shape[0] != env_arr.shape[0]:
+            self.background_final_signals_plot_pane.object = None
+            return
+        if nor_arr.shape[0] != env_arr.shape[0]:
+            self.background_final_signals_plot_pane.object = None
+            return
+        if not np.array_equal(dat_arr[:, 0], con_arr[:, 0]) or not np.array_equal(dat_arr[:, 0], env_arr[:, 0]):
+            self.background_final_signals_plot_pane.object = None
+            return
+        if not np.array_equal(nor_arr[:, 0], env_arr[:, 0]):
+            self.background_final_signals_plot_pane.object = None
+            return
+
+        bckgt = binary_sum(sample_t, con_arr, 1.0 - sample_t, env_arr)
+        sample_sub = dat_arr[:, 1] - (sample_t * con_arr[:, 1] + (1.0 - sample_t) * env_arr[:, 1])
+        sample_err = None
+        if show_error_bars and bckgt is not None:
+            subt = binary_sum(1.0, dat_arr, -1.0, bckgt)
+            if subt is not None and getattr(subt, "ndim", 0) == 2 and subt.shape[1] >= 3:
+                sample_sub = subt[:, 1]
+                sample_err = subt[:, 2]
+
+        van_sub = nor_arr[:, 1] - van_t * env_arr[:, 1]
+        van_err = None
+        if show_error_bars and nor_arr.shape[1] >= 3 and env_arr.shape[1] >= 3:
+            subt = binary_sum(1.0, nor_arr, -van_t, env_arr)
+            if subt is not None and getattr(subt, "ndim", 0) == 2 and subt.shape[1] >= 3:
+                van_sub = subt[:, 1]
+                van_err = subt[:, 2]
+
+        title = f"Background-subtracted signals (sample t={sample_t:.2f}, vanadium t={van_t:.2f})"
+        self.background_final_signals_plot_pane.object = build_final_background_subtracted_signals_figure(
+            x=dat_arr[:, 0],
+            sample_subtracted_y=sample_sub,
+            vanadium_subtracted_y=van_sub,
+            title=title,
+            sample_error_y=sample_err,
+            vanadium_error_y=van_err,
+        )
+
     def _set_background_selected_path(self, path: str) -> None:
         if self.current_project_state is None:
             return
+        self._clear_background_cached_measurement_state()
         state = self._get_background_state()
         state["selected_par_path"] = str(path or "").strip()
+        state["latest_measurement_artifact"] = None
         state["validation"]["is_valid"] = False
         state["validation"]["selected_par_path"] = str(path or "").strip()
         state["validation"]["file_accessible"] = False
@@ -1097,8 +1805,10 @@ class BackgroundControllerMixin:
         state = self._get_background_state()
         state["source_mode"] = event.new
         self._persist_background_state(state)
-        self.background_message.object = "Input mode changed. Choose a sample `.par` file."
-        self.background_message.alert_type = "secondary"
+        self._set_background_message_inline(
+            "Input mode changed. Choose a sample `.par` file.",
+            alert_type="secondary",
+        )
         self.background_extract_button.disabled = True
         self._set_background_source_widget_visibility()
         self._sync_background_import_visibility()
@@ -1117,8 +1827,10 @@ class BackgroundControllerMixin:
             return
         self._reset_background_t_controls_ui()
 
-        self.background_message.object = "Selection changed. Validate it to continue."
-        self.background_message.alert_type = "secondary"
+        self._set_background_message_inline(
+            "Selection changed. Validate it to continue.",
+            alert_type="secondary",
+        )
         self.background_extract_button.disabled = True
         self._sync_background_import_visibility()
         self._refresh_interaction_states()
@@ -1136,8 +1848,10 @@ class BackgroundControllerMixin:
                 return
         self._reset_background_t_controls_ui()
 
-        self.background_message.object = "Path changed. Validate it to continue."
-        self.background_message.alert_type = "secondary"
+        self._set_background_message_inline(
+            "Path changed. Validate it to continue.",
+            alert_type="secondary",
+        )
         self.background_extract_button.disabled = True
         self._sync_background_import_visibility()
         self._refresh_interaction_states()
@@ -1163,8 +1877,10 @@ class BackgroundControllerMixin:
 
         candidate_path = self._get_background_candidate_path()
         if candidate_path is None:
-            self.background_message.object = "Select a sample `.par` file path first."
-            self.background_message.alert_type = "danger"
+            self._set_background_message_inline(
+                "Select a sample `.par` file path first.",
+                alert_type="danger",
+            )
             self._refresh_interaction_states()
             return
 
@@ -1191,15 +1907,13 @@ class BackgroundControllerMixin:
 
         self.background_extract_button.disabled = not validation_result.is_valid
         if validation_result.is_valid:
-            self.background_message.object = ""
-            self.background_message.alert_type = "secondary"
-            self.background_message.visible = False
-            self._show_success_toast("Selected sample `.par` file is ready to extract.")
+            self._show_background_ready_to_extract_toast()
             return
 
-        self.background_message.object = validation_result.error or "Validation failed."
-        self.background_message.alert_type = "danger"
-        self.background_message.visible = True
+        self._set_background_message_inline(
+            validation_result.error or "Validation failed.",
+            alert_type="danger",
+        )
 
     def _prompt_background_import(self, candidate_path: Path) -> None:
         self._pending_background_import_path = candidate_path.resolve(strict=False)
@@ -1210,10 +1924,10 @@ class BackgroundControllerMixin:
         self.background_import_prompt.alert_type = "warning"
         self.background_import_prompt.visible = True
         self._sync_background_import_visibility()
-        self.background_message.object = (
-            "Copy the selected `.par` file into the project to validate it."
+        self._set_background_message_inline(
+            "Copy the selected `.par` file into the project to validate it.",
+            alert_type="warning",
         )
-        self.background_message.alert_type = "warning"
         self.background_extract_button.disabled = True
 
     def _clear_background_import_prompt(self) -> None:
@@ -1225,8 +1939,7 @@ class BackgroundControllerMixin:
 
     def _cancel_background_import(self, _event=None) -> None:
         self._clear_background_import_prompt()
-        self.background_message.object = "Import cancelled."
-        self.background_message.alert_type = "secondary"
+        self._set_background_message_inline("Import cancelled.", alert_type="secondary")
         self._refresh_interaction_states()
 
     def _copy_background_file_into_project(self, _event=None) -> None:
@@ -1241,11 +1954,13 @@ class BackgroundControllerMixin:
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / source_path.name
         if target_path.exists():
-            self.background_message.object = (
-                "A `.par` file with the same name already exists in `processed/parfiles/`. "
-                "Rename the source file manually and try again."
+            self._set_background_message_inline(
+                (
+                    "A `.par` file with the same name already exists in `processed/parfiles/`. "
+                    "Rename the source file manually and try again."
+                ),
+                alert_type="danger",
             )
-            self.background_message.alert_type = "danger"
             self.background_import_prompt.alert_type = "danger"
             self.background_import_prompt.object = (
                 "Import blocked because a file with the same name already exists."
@@ -1279,8 +1994,10 @@ class BackgroundControllerMixin:
         validation_state = self._get_background_state()["validation"]
         selected_par_path = validation_state.get("selected_par_path")
         if not validation_state.get("is_valid") or not selected_par_path:
-            self.background_message.object = "Validate a sample `.par` file before extracting."
-            self.background_message.alert_type = "danger"
+            self._set_background_message_inline(
+                "Validate a sample `.par` file before extracting.",
+                alert_type="danger",
+            )
             self._render_current_screen()
             return
 
@@ -1305,10 +2022,10 @@ class BackgroundControllerMixin:
             self.current_project_root / "processed" / "logfiles" / f"{run_id}-background-result.json"
         )
         self._clear_workspace_message()
-        self.background_message.object = (
-            "Extracting sample measurement. Workspace interactions are blocked until it finishes."
+        self._set_background_message_inline(
+            "Extracting sample measurement. Workspace interactions are blocked until it finishes.",
+            alert_type="warning",
         )
-        self.background_message.alert_type = "warning"
 
         par_file = Path(selected_par_path)
         if self._background_result_file.exists():
@@ -1458,8 +2175,10 @@ class BackgroundControllerMixin:
 
         self._background_active_run_id = None
         if result is None:
-            self.background_message.object = "Sample extraction finished without a result payload."
-            self.background_message.alert_type = "danger"
+            self._set_background_message_inline(
+                "Sample extraction finished without a result payload.",
+                alert_type="danger",
+            )
             self._render_current_screen()
             return
 
@@ -1504,14 +2223,16 @@ class BackgroundControllerMixin:
 
             self._persist_background_state(state)
             self._refresh_background_plots()
-            self.background_message.object = "Sample extraction finished successfully."
-            self.background_message.alert_type = "success"
+            self._set_background_message_inline(
+                "Sample extraction finished successfully.",
+                alert_type="success",
+            )
             self._show_success_toast("Sample extraction finished successfully.")
         else:
-            self.background_message.object = (
-                f"Sample extraction finished with errors. {result.error}"
+            self._set_background_message_inline(
+                f"Sample extraction finished with errors. {result.error}",
+                alert_type="danger",
             )
-            self.background_message.alert_type = "danger"
 
         self._render_current_screen()
 

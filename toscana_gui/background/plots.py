@@ -154,7 +154,7 @@ def build_linear_combination_chi_figure(
 
     fig.update_layout(
         title="Linear Combination: χ vs t",
-        xaxis_title="t",
+        xaxis_title="t (sample)",
         yaxis_title="χ",
         margin=dict(l=40, r=20, t=60, b=40),
         hovermode="x unified",
@@ -198,6 +198,114 @@ def build_linear_combination_subtraction_figure(
         )
     fig.add_trace(go.Scatter(x=x, y=sample_y, name="Sample", mode="lines"))
     fig.add_trace(go.Scatter(x=x, y=background_y, name="Background", mode="lines"))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Q (Å⁻¹)",
+        yaxis_title="Intensity (arbitrary units)",
+        margin=dict(l=40, r=20, t=60, b=40),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(separatethousands=True, exponentformat="none", showexponent="none")
+    return fig
+
+
+def build_vanadium_chi_figure(
+    trans: list[float],
+    chi: list[float],
+    fitted: list[float],
+    *,
+    best_t: float | None,
+    effective_t: float | None,
+) -> go.Figure:
+    fig = build_linear_combination_chi_figure(
+        trans,
+        chi,
+        fitted,
+        best_t=best_t,
+        effective_t=effective_t,
+    )
+    fig.update_layout(
+        title="Vanadium: \u03c7 vs t",
+        xaxis_title="t (vanadium)",
+    )
+    return fig
+
+
+def build_vanadium_subtraction_figure(
+    *,
+    x: np.ndarray,
+    vanadium_y: np.ndarray,
+    background_y: np.ndarray,
+    subtracted_y: np.ndarray,
+    title: str,
+    error_y: np.ndarray | None = None,
+) -> go.Figure:
+    fig = go.Figure()
+    trace_kwargs = {}
+    if error_y is not None:
+        trace_kwargs["error_y"] = {"type": "data", "array": error_y, "visible": True}
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=subtracted_y,
+            name="Vanadium - Background",
+            mode="lines",
+            **trace_kwargs,
+        )
+    )
+    fig.add_trace(go.Scatter(x=x, y=vanadium_y, name="Vanadium (in environment)", mode="lines"))
+    fig.add_trace(go.Scatter(x=x, y=background_y, name="Background (t*Environment)", mode="lines"))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Q (Å⁻¹)",
+        yaxis_title="Intensity (arbitrary units)",
+        margin=dict(l=40, r=20, t=60, b=40),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(separatethousands=True, exponentformat="none", showexponent="none")
+    return fig
+
+
+def build_final_background_subtracted_signals_figure(
+    *,
+    x: np.ndarray,
+    sample_subtracted_y: np.ndarray,
+    vanadium_subtracted_y: np.ndarray,
+    title: str,
+    sample_error_y: np.ndarray | None = None,
+    vanadium_error_y: np.ndarray | None = None,
+) -> go.Figure:
+    fig = go.Figure()
+
+    sample_kwargs = {}
+    if sample_error_y is not None:
+        sample_kwargs["error_y"] = {"type": "data", "array": sample_error_y, "visible": True}
+
+    vanadium_kwargs = {}
+    if vanadium_error_y is not None:
+        vanadium_kwargs["error_y"] = {"type": "data", "array": vanadium_error_y, "visible": True}
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=sample_subtracted_y,
+            name="Sample (linear-combination subtracted)",
+            mode="lines",
+            **sample_kwargs,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=vanadium_subtracted_y,
+            name="Vanadium (environment subtracted)",
+            mode="lines",
+            **vanadium_kwargs,
+        )
+    )
 
     fig.update_layout(
         title=title,

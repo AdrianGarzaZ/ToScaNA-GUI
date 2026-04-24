@@ -60,6 +60,11 @@ def refresh_interaction_states(shell) -> None:
     shell.background_error_bars_toggle.disabled = disabled
     shell.background_import_confirm_button.disabled = disabled
     shell.background_import_cancel_button.disabled = disabled
+    shell.background_export_folder_input.disabled = disabled
+    export_ready = shell._background_export_is_ready() if hasattr(shell, "_background_export_is_ready") else False
+    shell.background_export_button.disabled = disabled or not export_ready
+    shell.background_export_confirm_button.disabled = disabled
+    shell.background_export_cancel_button.disabled = disabled
     shell.manual_project_file_mode.disabled = disabled
     manual_picker_mode = shell.manual_project_file_mode.value == "Choose file"
     shell.manual_project_file_input.disabled = disabled or manual_picker_mode
@@ -94,6 +99,11 @@ def refresh_interaction_states(shell) -> None:
     shell.numors_next_block_button.disabled = disabled
     shell.numors_prev_plot_button.disabled = disabled
     shell.numors_next_plot_button.disabled = disabled
+
+    if hasattr(shell, "_refresh_background_export_hovercard"):
+        shell._refresh_background_export_hovercard()
+    if hasattr(shell, "_sync_background_export_prompt_visibility"):
+        shell._sync_background_export_prompt_visibility()
 
 
 def refresh_workspace_button_states(shell) -> None:
